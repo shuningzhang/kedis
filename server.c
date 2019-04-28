@@ -16,6 +16,23 @@ struct workqueue_struct *kedis_wq;
 static void kedis_listen_data_ready(struct sock *sk);
 static void kedis_data_ready(struct sock *sk);
 static void kedis_state_change(struct sock *sk);
+static void kc_put(struct kedis_client *kc);
+static void kc_get(struct kedis_client *kc);
+
+static int kedis_init_server(void)
+{
+	INIT_LIST_HEAD(&server.clients);
+
+	return 0;
+}
+
+static int kedis_recv_tcp_msg(struct socket *sock, void *data, size_t len)
+{
+	struct kvec vec = { .iov_len = len, .iov_base = data, };
+	struct msghdr msg = { .msg_flags = MSG_DONTWAIT, };
+
+	return kernel_recvmsg(sock, &msg, &vec, 1, len, msg.msg_flags);
+}
 
 static int kedis_advance_rx(struct kedis_client *kc)
 {
@@ -24,8 +41,12 @@ static int kedis_advance_rx(struct kedis_client *kc)
 	size_t datalen;
 
 	data = page_address(kc->kc_page);
-	datalen = 5;
-	kernel_recvmsg(kc->new_sock, );
+	datalen = 50;
+	kedis_recv_tcp_msg(kc->new_sock, data, datalen);
+	
+	printk(KERN_ERR "Recv: %s\n", (char *)data);
+	
+	return ret;
 }
 
 static void kedis_rx_all_data(struct work_struct *work)
@@ -35,7 +56,7 @@ static void kedis_rx_all_data(struct work_struct *work)
 	int ret;
 
 	do {
-	
+		ret = kedis_advance_rx(kc);	
 	} while (ret > 0);
 
 	if (ret <= 0 && ret != -EAGAIN) {
@@ -57,7 +78,7 @@ static void kc_kref_release(struct kref *kref)
 		kc->new_sock = NULL;
 	}
 
-	list_del_init(kc->client);
+	list_del_init(&kc->client);
 	kfree(kc);
 }
 
@@ -78,7 +99,7 @@ static void kedis_kc_queue_work(struct kedis_client *kc,
 {
 	kc_get(kc);
 	if (!queue_work(kedis_wq, work))
-		kc_put;
+		kc_put(kc);
 }
 static void kedis_register_callbacks(struct sock *sk, 
 				     struct kedis_client *kc)
@@ -99,6 +120,23 @@ static void kedis_register_callbacks(struct sock *sk,
 	sk->sk_state_change = kedis_state_change;
 
 	write_unlock_bh(&sk->sk_callback_lock);
+}
+
+static int kedis_unregister_callbacks(struct sock *sk,
+				      struct kedis_client *kc)
+{
+	int ret = 0;
+	
+	write_lock_bh(&sk->sk_callback_lock);
+	if (sk->sk_user_data == kc) {
+		ret = 1;
+		sk->sk_user_data = NULL;
+		sk->sk_data_ready = kc->kc_data_ready;
+		sk->sk_state_change = kc->kc_state_change;
+	}
+	write_unlock_bh(&sk->sk_callback_lock);
+
+	return ret;
 }
 
 /* When a client is connecting to this server, 
@@ -165,15 +203,18 @@ out:
 	state_change(sk);
 }
 
+
 static void kedis_data_ready(struct sock *sk)
 {
 	void (*ready)(struct sock *sk);
 
 	read_lock(&sk->sk_callback_lock);
 	if (sk->sk_user_data) {
-
-		ready = ;
+		struct kedis_client *kc = sk->sk_user_data;
+		kedis_kc_queue_work(kc, &kc->kc_rx_work);
+		ready = kc->kc_data_ready;
 	} else {
+		ready = sk->sk_data_ready;
 	}
 	read_unlock(&sk->sk_callback_lock);
 
@@ -242,7 +283,6 @@ static void kedis_accept_many(struct work_struct *work)
 		if (!more)
 			break;
 		cond_resched();
-	
 	}
 }
 
@@ -360,6 +400,7 @@ void kedis_stop_listening(void)
 
 static int kedis_init(void)
 {
+	kedis_init_server();
 	kedis_start_listening();
 	
 	return 0;
